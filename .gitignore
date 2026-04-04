@@ -1,0 +1,14 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Large media files
+*.mp4
+
+# YOLOv8 specific
+yolov8n.pt
+runs/
+
+# Environment and requirements
+.env
+venv/
