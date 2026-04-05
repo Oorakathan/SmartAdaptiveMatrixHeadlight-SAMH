@@ -1,36 +1,36 @@
 """
 ai_detector.py
 --------------
-Object detection worker + IoU tracker + ROI horizon mask + scene density.
+Object detection worker + IoU-based cross-frame tracker.
 
-New in this version
--------------------
-ROI horizon mask
-  Applied immediately after YOLO inference, before the tracker sees anything.
-  Any detection whose road-relevant y coordinate (y1_norm for glare = top of
-  box = headlamp position; cy_norm for hazard = body centre) falls ABOVE
-  config.ROI_HORIZON_RATIO is silently discarded.
-  Side margins (config.ROI_SIDE_MARGIN) clip bonnet reflections and mirror
-  artifacts at the frame edges.
+Key improvements over previous version
+---------------------------------------
+* IoU-based object tracker (ObjectTracker) assigns detections to persistent
+  tracks across frames. Each track has a smoothed (cx_norm, cy_norm) position
+  via EMA. This means:
+    - The shadow glides smoothly behind a moving car, not jumps pixel-by-pixel.
+    - Brief misdetections (1-3 frames) don't cause the shadow to vanish and
+      reappear ("disco flash"). The track stays alive for TRACKER_MAX_LOST_FRAMES.
+    - New ghost detections require TRACKER_MIN_HIT_STREAK hits before they
+      activate the LED controller — eliminates single-frame false positives.
 
-  Physical justification:
-    - A car at 50m appears in the bottom half of the frame in a dash-cam.
-    - Signboards, traffic lights, flyovers appear in the top portion.
-    - The road surface never extends above the horizon.
-    - Therefore, anything above the horizon cannot be a vehicle or pedestrian
-      ON THE ROAD — it's infrastructure or sky. Safe to discard.
+* annotate_frame is a PURE FUNCTION called only once in simulator._ui_poll.
 
-Scene density estimator
-  Counts confirmed glare tracks each frame, feeds an EMA.
-  Published as self.density_ema — read by the UI to select drive mode.
-  The LED controller then reads the current mode and applies beam shaping.
+* cy_norm mapping is physically correct:
+    - Glare (car headlights): TOP of bounding box (y1).
+    - Hazard (pedestrian/animal): CENTRE of bounding box.
 
 Queue contract
 --------------
   Consumes: frame_queue  ← np.ndarray BGR
-  Produces: result_queue ← (raw_frame, confirmed_tracks, density_ema)
-            confirmed_tracks: list[dict] with smoothed position + conf_ema
-            density_ema:      float — EMA vehicle count this frame
+  Produces: result_queue ← (raw_frame, confirmed_tracks)
+            confirmed_tracks: list[dict] — only tracks with hit_streak >= MIN_HIT_STREAK
+            Each dict has all keys of a detection dict plus:
+              "track_id"  : int    — stable ID across frames
+              "cx_norm"   : float  — EMA-smoothed horizontal centre
+              "cy_norm"   : float  — EMA-smoothed vertical position
+              "conf_ema"  : float  — EMA-smoothed confidence
+              "lost"      : int    — frames since last matched detection (0 if active)
 """
 
 import math
@@ -51,57 +51,11 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ROI FILTER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _roi_filter(detections: list) -> list:
-    """
-    Discard detections that cannot physically be on the road.
-
-    Rules applied (all normalised 0–1):
-      1. Glare (car/truck/bus): y1_norm (TOP of box = headlamp) must be
-         >= ROI_HORIZON_RATIO.  A headlamp below the horizon = real vehicle.
-      2. Hazard (person/bike): cy_norm (body centre) must be
-         >= ROI_HORIZON_RATIO.
-      3. Any category: cx_norm must be within [ROI_SIDE_MARGIN, 1-ROI_SIDE_MARGIN].
-
-    Why y1 for glare and cy for hazard?
-      Headlamps sit at the TOP of the car body. A far car has a small box near
-      the top of the frame — its headlamp (y1) is near the horizon.
-      A pedestrian's centre is their torso — mid-box is representative.
-    """
-    horizon = config.ROI_HORIZON_RATIO
-    side    = config.ROI_SIDE_MARGIN
-    out = []
-    for d in detections:
-        cx = d["cx_norm"]
-        # Side margin: discard bonnet / mirror reflections
-        if cx < side or cx > 1.0 - side:
-            continue
-
-        cat = d["category"]
-        if cat == "glare":
-            # y1_norm = top of bounding box, normalised to frame height
-            x1, y1, x2, y2 = d["box_norm"]
-            if y1 < horizon:
-                continue   # headlamp above horizon → not a real road vehicle
-        elif cat == "hazard":
-            if d["cy_norm"] < horizon:
-                continue   # person above horizon → sign, banner, not a pedestrian
-        # "other" category: apply cy_norm check too
-        else:
-            if d["cy_norm"] < horizon:
-                continue
-
-        out.append(d)
-    return out
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# IoU TRACKER  (unchanged from previous version)
+# IoU TRACKER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _iou(a: tuple, b: tuple) -> float:
+    """Compute Intersection-over-Union of two (x1,y1,x2,y2) boxes."""
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
@@ -115,6 +69,7 @@ def _iou(a: tuple, b: tuple) -> float:
 
 
 class _Track:
+    """Single persistent object track."""
     _id_counter = 0
 
     def __init__(self, det: dict):
@@ -122,19 +77,29 @@ class _Track:
         self.id         = _Track._id_counter
         self.category   = det["category"]
         self.label      = det["label"]
+
+        # EMA-smoothed position and size
         self.cx_norm    = det["cx_norm"]
         self.cy_norm    = det["cy_norm"]
         self.w_norm     = det["w_norm"]
         self.h_norm     = det["h_norm"]
+
+        # EMA confidence — starts at raw detection conf
         self.conf_ema   = det["conf"]
+
+        # Last known raw bounding box (used for IoU matching)
         self.box        = det["box"]
-        self.hit_streak = 1
-        self.lost       = 0
+
+        # Lifecycle counters
+        self.hit_streak = 1      # consecutive frames matched
+        self.lost       = 0      # frames since last match
 
     def update(self, det: dict):
+        """Incorporate a new matched detection via EMA."""
         a_pos  = config.TRACK_POS_ALPHA
         a_size = config.TRACK_SIZE_ALPHA
         a_conf = config.CONF_EMA_ALPHA
+
         self.cx_norm  = a_pos  * det["cx_norm"] + (1 - a_pos)  * self.cx_norm
         self.cy_norm  = a_pos  * det["cy_norm"] + (1 - a_pos)  * self.cy_norm
         self.w_norm   = a_size * det["w_norm"]  + (1 - a_size) * self.w_norm
@@ -146,33 +111,65 @@ class _Track:
         self.lost = 0
 
     def predict(self):
-        self.conf_ema *= (1.0 - config.CONF_EMA_ALPHA)
+        """Called when no match found — track keeps previous position, loses confidence."""
+        decay = 1.0 - config.CONF_EMA_ALPHA   # gentle confidence decay while lost
+        self.conf_ema *= decay
         self.lost += 1
         self.hit_streak = max(0, self.hit_streak - 1)
 
     def to_det_dict(self) -> dict:
+        """Export as a detection-compatible dict for the LED controller."""
         return {
-            "track_id": self.id, "label": self.label,
-            "conf": self.conf_ema, "box": self.box,
-            "cx_norm": self.cx_norm, "cy_norm": self.cy_norm,
-            "w_norm": self.w_norm, "h_norm": self.h_norm,
-            "category": self.category, "lost": self.lost,
+            "track_id":  self.id,
+            "label":     self.label,
+            "conf":      self.conf_ema,
+            "box":       self.box,
+            "cx_norm":   self.cx_norm,
+            "cy_norm":   self.cy_norm,
+            "w_norm":    self.w_norm,
+            "h_norm":    self.h_norm,
+            "category":  self.category,
+            "lost":      self.lost,
         }
 
 
 class ObjectTracker:
+    """
+    Greedy IoU-based multi-object tracker.
+
+    For each new frame of raw detections:
+      1. Compute IoU between every existing track and every new detection.
+      2. Greedily assign (highest IoU first) if IoU ≥ TRACKER_IOU_THRESHOLD.
+      3. Unmatched tracks → predict() (age them, decay confidence).
+      4. Unmatched detections → create new tracks.
+      5. Prune tracks dead for > TRACKER_MAX_LOST_FRAMES.
+      6. Return only "confirmed" tracks (hit_streak ≥ MIN_HIT_STREAK).
+
+    Why greedy and not Hungarian algorithm?
+      At typical headlamp scene density (2-5 vehicles), greedy is both fast
+      enough and accurate enough. Hungarian adds O(n^3) complexity for no
+      practical gain at this scale.
+    """
+
     def __init__(self):
         self._tracks: list[_Track] = []
 
     def update(self, detections: list) -> list:
-        unmatched_dets    = list(range(len(detections)))
+        """
+        Update tracker with new detections. Returns list of confirmed track dicts.
+        """
+        # ── 1. Build IoU matrix ───────────────────────────────────────────────
+        unmatched_dets   = list(range(len(detections)))
         matched_track_ids = set()
 
         if self._tracks and detections:
+            # Score matrix: tracks × detections
             iou_matrix = [
                 [_iou(t.box, d["box"]) for d in detections]
                 for t in self._tracks
             ]
+
+            # Greedy match: best IoU pairs first
             pairs = []
             for ti, row in enumerate(iou_matrix):
                 for di, score in enumerate(row):
@@ -180,27 +177,41 @@ class ObjectTracker:
                         pairs.append((score, ti, di))
             pairs.sort(reverse=True)
 
-            used_tracks = set(); used_dets = set()
+            used_tracks = set()
+            used_dets   = set()
             for score, ti, di in pairs:
                 if ti in used_tracks or di in used_dets:
                     continue
+                # Only match same category to prevent car→person swap
                 if self._tracks[ti].category == detections[di]["category"]:
                     self._tracks[ti].update(detections[di])
                     matched_track_ids.add(ti)
-                    used_tracks.add(ti); used_dets.add(di)
+                    used_tracks.add(ti)
+                    used_dets.add(di)
 
             unmatched_dets = [di for di in range(len(detections)) if di not in used_dets]
 
+        # ── 2. Predict unmatched tracks ───────────────────────────────────────
         for ti, track in enumerate(self._tracks):
             if ti not in matched_track_ids:
                 track.predict()
 
+        # ── 3. Create new tracks for unmatched detections ─────────────────────
         for di in unmatched_dets:
             self._tracks.append(_Track(detections[di]))
 
-        self._tracks = [t for t in self._tracks if t.lost <= config.TRACKER_MAX_LOST_FRAMES]
+        # ── 4. Prune dead tracks ──────────────────────────────────────────────
+        self._tracks = [
+            t for t in self._tracks
+            if t.lost <= config.TRACKER_MAX_LOST_FRAMES
+        ]
 
-        return [t.to_det_dict() for t in self._tracks if t.hit_streak >= config.TRACKER_MIN_HIT_STREAK]
+        # ── 5. Return confirmed tracks only ───────────────────────────────────
+        return [
+            t.to_det_dict()
+            for t in self._tracks
+            if t.hit_streak >= config.TRACKER_MIN_HIT_STREAK
+        ]
 
     def reset(self):
         self._tracks.clear()
@@ -211,6 +222,8 @@ class ObjectTracker:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MockDetector:
+    """Synthetic moving detections — no model required."""
+
     def __init__(self):
         self._t = 0.0
 
@@ -218,17 +231,24 @@ class MockDetector:
         self._t += 0.025
         h, w = frame.shape[:2]
         results = []
+
         cx = int((math.sin(self._t * 0.6) * 0.38 + 0.5) * w)
-        cy = int(h * 0.60)   # well below horizon
+        cy = int(h * 0.40)
         hw, hh = int(w * 0.10), int(h * 0.12)
-        results.append(_make_detection("car", 0.88, (cx-hw, cy-hh, cx+hw, cy+hh), w, h))
+        results.append(_make_detection(
+            "car", 0.88, (cx - hw, cy - hh, cx + hw, cy + hh), w, h))
+
         if math.sin(self._t * 0.4 + 2.1) > 0.55:
-            cx2, cy2 = int(w * 0.75), int(h * 0.65)
+            cx2, cy2 = int(w * 0.75), int(h * 0.38)
             hw2, hh2 = int(w * 0.08), int(h * 0.10)
-            results.append(_make_detection("car", 0.72, (cx2-hw2, cy2-hh2, cx2+hw2, cy2+hh2), w, h))
+            results.append(_make_detection(
+                "car", 0.72, (cx2 - hw2, cy2 - hh2, cx2 + hw2, cy2 + hh2), w, h))
+
         if math.sin(self._t * 0.28 + 1.5) > 0.45:
-            px, py = int(w * 0.80), int(h * 0.70)
-            results.append(_make_detection("person", 0.76, (px-28, py-70, px+28, py+30), w, h))
+            px, py = int(w * 0.80), int(h * 0.55)
+            results.append(_make_detection(
+                "person", 0.76, (px - 28, py - 70, px + 28, py + 30), w, h))
+
         return results
 
     @staticmethod
@@ -237,6 +257,8 @@ class MockDetector:
 
 
 class YOLODetector:
+    """YOLOv8-nano via Ultralytics."""
+
     def __init__(self, model_name):
         self._model = _YOLO(model_name)
         self._names = self._model.names
@@ -260,7 +282,8 @@ class YOLODetector:
 # DETECTION DICT FACTORY
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _make_detection(label: str, conf: float, box: tuple, frame_w: int, frame_h: int) -> dict:
+def _make_detection(label: str, conf: float,
+                    box: tuple, frame_w: int, frame_h: int) -> dict:
     x1, y1, x2, y2 = box
     cx_norm = ((x1 + x2) / 2.0) / frame_w
     is_glare = label in config.GLARE_CLASSES
@@ -274,13 +297,9 @@ def _make_detection(label: str, conf: float, box: tuple, frame_w: int, frame_h: 
         "other"
     )
     return {
-        "label": label, "conf": conf,
-        "box": (x1, y1, x2, y2),
-        # Normalised box corners — used by ROI filter (avoids re-dividing)
-        "box_norm": (x1/frame_w, y1/frame_h, x2/frame_w, y2/frame_h),
+        "label": label, "conf": conf, "box": (x1, y1, x2, y2),
         "cx_norm": cx_norm, "cy_norm": cy_norm,
-        "w_norm": w_norm, "h_norm": h_norm,
-        "category": category,
+        "w_norm": w_norm, "h_norm": h_norm, "category": category,
     }
 
 
@@ -293,42 +312,26 @@ def _scale_boxes(detections: list, sx: float, sy: float) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ANNOTATE FRAME
+# ANNOTATE FRAME  (pure function — called ONCE in simulator._ui_poll)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def annotate_frame(
-    frame:       np.ndarray,
-    detections:  list,
-    led_states:  list,
-    zone_states: list,
-    drive_mode:  str  = "highway",
-    show_boxes:  bool = True,
-    show_zones:  bool = True,
-    show_horizon:bool = True,
+    frame:        np.ndarray,
+    detections:   list,
+    led_states:   list,
+    zone_states:  list,
+    show_boxes:   bool = True,
+    show_zones:   bool = True,
 ) -> np.ndarray:
     out = frame.copy()
     fh, fw = out.shape[:2]
     cols = config.ZONE_COUNT
     rows = config.ROW_LEDS
 
-    # ── Horizon line ──────────────────────────────────────────────────────────
-    if show_horizon:
-        hy = int(config.ROI_HORIZON_RATIO * fh)
-        cv2.line(out, (0, hy), (fw, hy), config.CV_COLOR_HORIZON, 1)
-        cv2.putText(out, f"ROI horizon ({config.ROI_HORIZON_RATIO:.0%})",
-                    (6, hy - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.32,
-                    config.CV_COLOR_HORIZON, 1, cv2.LINE_AA)
-
-        # Side margin lines
-        lx = int(config.ROI_SIDE_MARGIN * fw)
-        rx = int((1 - config.ROI_SIDE_MARGIN) * fw)
-        cv2.line(out, (lx, hy), (lx, fh), config.CV_COLOR_HORIZON, 1)
-        cv2.line(out, (rx, hy), (rx, fh), config.CV_COLOR_HORIZON, 1)
-
-    # ── Zone overlay ──────────────────────────────────────────────────────────
     if show_zones:
         seg_w = fw / cols
         seg_h = fh / rows
+
         for r in range(rows):
             for c in range(cols):
                 state = led_states[r][c]
@@ -338,41 +341,28 @@ def annotate_frame(
                     color, alpha = config.CV_COLOR_HAZARD, config.CV_ALPHA_HAZARD
                 else:
                     continue
+
                 x1 = int(c * seg_w); y1 = int(r * seg_h)
-                x2 = int((c+1) * seg_w); y2 = int((r+1) * seg_h)
+                x2 = int((c + 1) * seg_w); y2 = int((r + 1) * seg_h)
                 overlay = out.copy()
                 cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-                cv2.addWeighted(overlay, alpha, out, 1-alpha, 0, out)
+                cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0, out)
 
         for c in range(cols):
-            x_label = int((c+0.5)*seg_w)
-            cv2.putText(out, f"Z{c+1}", (x_label-8, 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (190,190,190), 1, cv2.LINE_AA)
+            x_label = int((c + 0.5) * seg_w)
+            cv2.putText(out, f"Z{c+1}", (x_label - 8, 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (190, 190, 190), 1, cv2.LINE_AA)
         for c in range(1, cols):
-            cv2.line(out, (int(c*seg_w),0), (int(c*seg_w),fh), (40,60,80), 1)
+            cv2.line(out, (int(c * seg_w), 0), (int(c * seg_w), fh), (40, 60, 80), 1)
         for r in range(1, rows):
-            cv2.line(out, (0,int(r*seg_h)), (fw,int(r*seg_h)), (40,60,80), 1)
+            cv2.line(out, (0, int(r * seg_h)), (fw, int(r * seg_h)), (40, 60, 80), 1)
 
-    # ── Drive mode badge ──────────────────────────────────────────────────────
-    mode_colors = {
-        config.DRIVE_MODE_HIGHWAY:    (0, 200, 170),
-        config.DRIVE_MODE_EXPRESSWAY: (58, 142, 246),
-        config.DRIVE_MODE_CITY:       (245, 158, 11),
-    }
-    mc = mode_colors.get(drive_mode, (150, 150, 150))
-    badge = f" {drive_mode.upper()} MODE "
-    (bw, bh), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-    cv2.rectangle(out, (fw - bw - 14, 4), (fw - 4, bh + 10), mc, -1)
-    cv2.putText(out, badge, (fw - bw - 10, bh + 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (10, 15, 30), 1, cv2.LINE_AA)
-
-    # ── Bounding boxes ────────────────────────────────────────────────────────
     if show_boxes:
         for det in detections:
             x1, y1, x2, y2 = det["box"]
             cat   = det["category"]
             label = det["label"]
-            conf  = det.get("conf", 0)
+            conf  = det.get("conf_ema", det["conf"])
             tid   = det.get("track_id", "")
             lost  = det.get("lost", 0)
 
@@ -383,18 +373,19 @@ def annotate_frame(
             else:
                 color, tag = (140, 140, 140), ""
 
+            # Dim box if track is coasting (lost but still alive)
             if lost > 0:
                 color = tuple(int(v * 0.5) for v in color)
 
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            tag_str  = f"[{tag}]" if tag else ""
+            tag_str = f"[{tag}]" if tag else ""
             lost_str = f" ~{lost}" if lost > 0 else ""
             text = f"#{tid}{lost_str} {tag_str} {label} {conf:.0%}"
             (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-            ty = max(y1-4, th+4)
-            cv2.rectangle(out, (x1, ty-th-4), (x1+tw+4, ty), color, -1)
-            cv2.putText(out, text, (x1+2, ty-2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240,240,240), 1, cv2.LINE_AA)
+            ty = max(y1 - 4, th + 4)
+            cv2.rectangle(out, (x1, ty - th - 4), (x1 + tw + 4, ty), color, -1)
+            cv2.putText(out, text, (x1 + 2, ty - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
 
     return out
 
@@ -405,8 +396,12 @@ def annotate_frame(
 
 class AIDetector:
     """
-    Pipeline: raw frame → YOLO → ROI filter → confidence filter → tracker
-              → confirmed tracks + density EMA → result_queue
+    Pulls raw frames from frame_queue, runs detection + tracking, pushes
+    (raw_frame, confirmed_tracks) to result_queue.
+
+    The tracker runs here in the AI thread so it processes every detected frame.
+    Only confirmed tracks (hit_streak ≥ MIN_HIT_STREAK) reach the LED controller,
+    preventing ghost flashes from single-frame false positives.
     """
 
     def __init__(self, frame_queue: queue.Queue, result_queue: queue.Queue):
@@ -415,11 +410,9 @@ class AIDetector:
         self._running = False
         self._thread  = None
 
-        self._detector   = YOLODetector(config.MODEL_NAME) if _YOLO_AVAILABLE else MockDetector()
-        self._tracker    = ObjectTracker()
+        self._detector = YOLODetector(config.MODEL_NAME) if _YOLO_AVAILABLE else MockDetector()
+        self._tracker  = ObjectTracker()
 
-        # Scene density EMA — read by UI thread for mode switching
-        self.density_ema      = 0.0
         self.frames_processed = 0
         self.actual_fps       = 0.0
 
@@ -431,9 +424,9 @@ class AIDetector:
         if self._running:
             return
         self._tracker.reset()
-        self.density_ema = 0.0
         self._running = True
-        self._thread  = threading.Thread(target=self._run, daemon=True, name="AIDetector")
+        self._thread  = threading.Thread(
+            target=self._run, daemon=True, name="AIDetector")
         self._thread.start()
 
     def stop(self):
@@ -458,42 +451,34 @@ class AIDetector:
 
             disp_h, disp_w = frame.shape[:2]
 
-            # Resize to AI resolution
             if disp_w != config.AI_FRAME_W or disp_h != config.AI_FRAME_H:
-                ai_frame = cv2.resize(frame, (config.AI_FRAME_W, config.AI_FRAME_H),
-                                      interpolation=cv2.INTER_AREA)
+                ai_frame = cv2.resize(
+                    frame, (config.AI_FRAME_W, config.AI_FRAME_H),
+                    interpolation=cv2.INTER_AREA)
             else:
                 ai_frame = frame
 
-            # 1. Raw detections from model
+            # Raw detections from model (at AI resolution)
             raw_dets = self._detector.detect(ai_frame)
 
-            # 2. Confidence filter
-            conf_filtered = [
+            # Filter by minimum confidence per category before tracking
+            filtered = [
                 d for d in raw_dets
                 if (d["category"] == "glare"  and d["conf"] >= config.MIN_CONFIDENCE_GLARE)
                 or (d["category"] == "hazard" and d["conf"] >= config.MIN_CONFIDENCE_HAZARD)
                 or (d["category"] == "other")
             ]
 
-            # 3. ROI horizon mask — discard sky / signboard detections
-            roi_filtered = _roi_filter(conf_filtered)
+            # Update tracker → get smoothed, confirmed tracks
+            confirmed_tracks = self._tracker.update(filtered)
 
-            # 4. Tracker → smoothed confirmed tracks
-            confirmed = self._tracker.update(roi_filtered)
-
-            # 5. Scene density EMA (glare tracks only = vehicles)
-            glare_count = sum(1 for t in confirmed if t["category"] == "glare")
-            alpha = config.DENSITY_EMA_ALPHA
-            self.density_ema = alpha * glare_count + (1 - alpha) * self.density_ema
-
-            # 6. Scale boxes to display resolution
+            # Scale boxes back to display-frame pixel coords
             sx = disp_w / config.AI_FRAME_W
             sy = disp_h / config.AI_FRAME_H
-            scaled = _scale_boxes(confirmed, sx, sy)
+            scaled_tracks = _scale_boxes(confirmed_tracks, sx, sy)
 
             try:
-                self._rq.put_nowait((frame, scaled, self.density_ema))
+                self._rq.put_nowait((frame, scaled_tracks))
             except queue.Full:
                 pass
 
