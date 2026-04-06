@@ -36,7 +36,6 @@ class VideoFeeder:
         self._paused  = False
         self._thread  = None
 
-        # Public stats — written by worker, read by UI
         self.actual_fps  = 0.0
         self.frame_count = 0
         self.video_fps   = 0.0
@@ -44,10 +43,7 @@ class VideoFeeder:
         self.video_h     = 0
         self.duration_s  = 0.0
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def load(self, path: str) -> bool:
-        """Open the file and read metadata. Returns False if unreadable."""
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             cap.release()
@@ -95,8 +91,6 @@ class VideoFeeder:
     @property
     def is_paused(self) -> bool:
         return self._paused
-
-    # ── Worker ────────────────────────────────────────────────────────────────
 
     def _run(self):
         cap = cv2.VideoCapture(self._path)
