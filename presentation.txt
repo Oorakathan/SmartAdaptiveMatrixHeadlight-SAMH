@@ -1,0 +1,82 @@
+System Architecture Overview
+Stage 1: Video Feeder (Input)
+Stage 2: AI Detection & Tracking
+Stage 3: Scene Density Estimation
+Stage 4: Drive Mode State Machine
+
+Detailed Flow:
+
+User starts video
+    ↓
+VideoFeeder._run() [daemon thread]
+    ├─ Reads video file frame-by-frame
+    ├─ Resizes to target resolution
+    ├─ Throttles to target FPS
+    └─ Pushes to frame_queue (max size: 2)
+    ↓
+AIDetector._run() [daemon thread]
+    ├─ Pulls frame from frame_queue
+    ├─ Resizes to AI resolution (640×360)
+    ├─ Runs YOLO inference
+    ├─ Filters by confidence
+    ├─ Applies ROI horizon mask
+    ├─ Runs IoU tracker
+    ├─ Computes scene density EMA
+    └─ Pushes to result_queue (raw_frame, confirmed_tracks, density_ema)
+    ↓
+Simulator UI [main thread, polls queues]
+    ├─ Reads result_queue
+    ├─ Updates DriveModeStateMachine with density_ema
+    ├─ Updates ZoneController with confirmed tracks
+    ├─ Annotates frame with detections & zones
+    └─ Renders to Tkinter canvas
+
+
+    IoU Tracking system example:
+
+    Frame 1:
+  YOLO detects: Car at (x=100, y=200) with confidence 0.88
+  ROI filter: ✓ passes
+  Tracker: No existing tracks
+  Action: CREATE new track #1
+    Track[1] = {cx_norm: 0.25, conf_ema: 0.88, hit_streak: 1, lost: 0}
+
+Frame 2:
+  YOLO detects: Car at (x=105, y=195) with confidence 0.92
+  ROI filter: ✓ passes
+  Tracker: IoU(track[1], detection) = 0.95 ✓ HIGH
+  Action: UPDATE track #1
+    Track[1].update() → EMA position, EMA confidence
+    conf_ema = 0.30 * 0.92 + 0.70 * 0.88 = 0.896
+    hit_streak: 1 → 2  ✓ NOW CONFIRMED (min_streak=2)
+    lost: 0
+
+Frame 3:
+  YOLO detects: Car at (x=110, y=190) with confidence 0.89
+  Matches to track[1] again
+  hit_streak: 2 → 3
+  lost: 0
+
+Frame 4 (TEMPORARY OCCLUSION):
+  YOLO detects: Nothing! (car behind truck)
+  Tracker: track[1] has no match
+  Action: PREDICT
+    track[1].predict() → 
+      conf_ema *= 0.70 (decay to 0.627)
+      lost: 0 → 1
+      hit_streak: 3 → 2
+    
+  Track[1] still in output (lost=1 ≤ MAX=12)
+  BUT will appear "grayed out" in UI (lost > 0)
+
+Frame 5 (REAPPEARS):
+  YOLO detects: Car at (x=115, y=185) with confidence 0.91
+  Matches to track[1] again
+  Action: UPDATE
+    conf_ema = 0.30 * 0.91 + 0.70 * 0.627 = 0.711
+    lost: 1 → 0
+    hit_streak: 2 → 3
+    
+Result: Smooth, continuous track through occlusion
+
+

@@ -23,7 +23,7 @@ New in this version
 """
 
 # ── Matrix dimensions ─────────────────────────────────────────────────────────
-ZONE_COUNT = 24
+ZONE_COUNT = 8
 ROW_LEDS   = 8
 
 # ── Zone geometry ─────────────────────────────────────────────────────────────
